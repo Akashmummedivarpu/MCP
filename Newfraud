@@ -1,0 +1,546 @@
+"""
+synthetic_cc_fraud_final.py
+
+Combined, hackathon-ready script that:
+- fixes/normalizes credit-card transaction columns
+- provides CTGAN-based generation (if ctgan installed) with fast defaults
+- provides a tiny VAE generator (if TensorFlow installed) for ~500 rows
+- concatenates CTGAN + VAE outputs into a combined synthetic dataset
+- implements fraud injectors: international_mix, rapid_high_value, spending_spike, fraud_refund
+- applies fraud patterns and exports final CSV
+
+Usage:
+    python synthetic_cc_fraud_final.py
+
+Notes:
+- Designed for quick experimentation. Increase epochs for better quality.
+- If ctgan or tensorflow are missing, the script falls back to resampling/jitter.
+"""
+
+import uuid
+import random
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from ctgan import CTGAN
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, Lambda
+from tensorflow.keras.models import Model
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+# ------------------------------
+# Utilities
+# ------------------------------
+
+def new_tx_id():
+    return str(uuid.uuid4())
+
+def random_card_id():
+    return "card_" + uuid.uuid4().hex[:12]
+
+def random_account_id():
+    return "acct_" + uuid.uuid4().hex[:10]
+
+def pick_merchant():
+    merchants = [
+        ("Amazon India", "online"),
+        ("Flipkart", "online"),
+        ("Starbucks", "cafe"),
+        ("BigBazaar", "grocery"),
+        ("Hotel ABC", "travel"),
+        ("Zomato", "food_delivery"),
+    ]
+    return random.choice(merchants)
+
+# ------------------------------
+# Column fixer
+# ------------------------------
+
+REQUIRED_COLUMNS = [
+    "transaction_id", "account_id", "card_id", "timestamp", "amount",
+    "currency", "merchant_country", "merchant_name", "merchant_category",
+    "device_id", "is_fraud", "fraud_type", "original_tx_id"
+]
+
+def fix_columns(df: pd.DataFrame, home_country: str = "IN") -> pd.DataFrame:
+    """
+    Ensure the dataframe has consistent columns needed for credit-card transactions.
+    Adds defaults if missing. Converts timestamp to pandas datetime.
+    """
+    df = df.copy()
+    n = len(df)
+    # common fallback columns
+    if "transaction_id" not in df.columns:
+        df["transaction_id"] = [new_tx_id() for _ in range(n)]
+    if "account_id" not in df.columns:
+        df["account_id"] = [random_account_id() for _ in range(n)]
+    if "card_id" not in df.columns:
+        df["card_id"] = [random_card_id() for _ in range(n)]
+    if "timestamp" not in df.columns:
+        now = datetime.utcnow()
+        df["timestamp"] = [now - timedelta(days=random.random()*30) for _ in range(n)]
+    if "amount" not in df.columns:
+        df["amount"] = np.round(np.random.uniform(10, 2000, size=n), 2)
+    if "currency" not in df.columns:
+        df["currency"] = "INR"
+    if "merchant_country" not in df.columns:
+        df["merchant_country"] = home_country
+    if "merchant_name" not in df.columns or "merchant_category" not in df.columns:
+        merch = [pick_merchant() for _ in range(n)]
+        df["merchant_name"] = [m[0] for m in merch]
+        df["merchant_category"] = [m[1] for m in merch]
+    if "device_id" not in df.columns:
+        df["device_id"] = ["dev_" + uuid.uuid4().hex[:8] for _ in range(n)]
+    # fraud markers
+    if "is_fraud" not in df.columns:
+        df["is_fraud"] = 0
+    if "fraud_type" not in df.columns:
+        df["fraud_type"] = ""
+    if "original_tx_id" not in df.columns:
+        df["original_tx_id"] = None
+
+    # ensure timestamp type
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    # keep required columns present
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df
+
+# ------------------------------
+# Fraud injectors (kept as provided)
+# ------------------------------
+
+def inject_international_mix(df: pd.DataFrame, cond: dict, home_country="IN") -> pd.DataFrame:
+    out = []
+    total_tx = int(cond.get("total_tx", 5))
+    same_country = int(cond.get("same_country", 3))
+    foreign_count = int(cond.get("foreign_countries", 2))
+    time_window_hours = float(cond.get("time_window_hours", 24))
+
+    foreign_pool = ["US", "GB", "SG", "AE", "FR", "DE", "CN", "JP", "AU"]
+
+    acct_row = df.sample(1).iloc[0]
+    acct = acct_row["account_id"]
+    start = acct_row["timestamp"]
+    start = pd.to_datetime(start)
+    start = datetime.utcnow() - timedelta(days=np.random.random()*2) if np.random.rand() < 0.5 else start
+
+    times = sorted([ start + timedelta(seconds=int(np.random.random()*time_window_hours*3600))
+                     for _ in range(total_tx) ])
+
+    for i in range(same_country):
+        row = acct_row.copy().to_dict()
+        row["transaction_id"] = new_tx_id()
+        row["account_id"] = acct
+        row["timestamp"] = times.pop(0)
+        row["merchant_country"] = home_country
+        row["currency"] = "INR"
+        row["amount"] = round(max(10.0, np.random.normal(100,50)),2)
+        row["is_fraud"] = 1
+        row["fraud_type"] = "international_mix"
+        out.append(row)
+
+    chosen_foreign = random.sample(foreign_pool, k=foreign_count)
+    for country in chosen_foreign:
+        row = acct_row.copy().to_dict()
+        row["transaction_id"] = new_tx_id()
+        row["account_id"] = acct
+        row["timestamp"] = times.pop(0) if times else datetime.utcnow()
+        row["merchant_country"] = country
+        row["currency"] = "USD" if country != "IN" else "INR"
+        row["amount"] = round(max(50.0, np.random.normal(150,80)),2)
+        row["is_fraud"] = 1
+        row["fraud_type"] = "international_mix"
+        out.append(row)
+
+    return pd.DataFrame(out)
+
+
+import random
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+
+def inject_rapid_high_value(df: pd.DataFrame, cond: dict) -> pd.DataFrame:
+    total_tx = int(cond.get("total_tx", 5))  # Total number of fraudulent transactions to create across all accounts
+    threshold = float(cond.get("max_amount", 5000))  # Maximum possible transaction amount
+    time_window_min = float(cond.get("time_window_min", 10))  # Time window for transactions in minutes
+
+    # Select `total_tx` number of random accounts to distribute the transactions across
+    accounts = df["account_id"].unique()  # Get all unique account IDs
+    num_accts = len(accounts)
+    
+    # Calculate the number of transactions per account. It could be fractional, so we will round appropriately.
+    transactions_per_acct = total_tx // num_accts  # Number of transactions per account
+    remaining_transactions = total_tx % num_accts  # Handle the remainder transactions
+    
+    # Randomly select accounts to allocate the remaining transactions
+    selected_accts = random.sample(list(accounts), num_accts)
+
+    out = []  # To store the resulting fraudulent transactions
+    
+    for i, acct in enumerate(selected_accts):
+        # Randomly sample a row for each selected account
+        acct_row = df[df["account_id"] == acct].sample(1).iloc[0]
+        base_time = acct_row["timestamp"]
+        base_time = datetime.utcnow() - timedelta(hours=np.random.random() * 48) if np.random.rand() < 0.5 else pd.to_datetime(base_time)
+
+        # Distribute the transactions across accounts
+        # If there are remaining transactions, this account will get one extra transaction
+        num_transactions = transactions_per_acct + (1 if i < remaining_transactions else 0)
+        
+        # Generate fraudulent transactions for this account
+        times = [base_time + timedelta(seconds=random.randint(0, int(time_window_min * 60))) for _ in range(num_transactions)]
+
+        for t in times:
+            # Create a fraudulent transaction
+            row = acct_row.copy().to_dict()
+            row["transaction_id"] = new_tx_id()  # Assuming `new_tx_id` is a function that generates unique IDs
+            row["account_id"] = acct
+            row["timestamp"] = t
+            row["amount"] = round(np.random.uniform(threshold * 1.1, threshold * 3.0), 2)  # High value transaction
+            row["is_fraud"] = 1
+            row["fraud_type"] = "rapid_high_value"
+            row["merchant_country"] = row.get("merchant_country", "IN")  # Default to "IN" if not available
+            out.append(row)
+
+    # Return a DataFrame with all the injected fraud transactions
+    return pd.DataFrame(out)
+
+
+def inject_spending_spike(df: pd.DataFrame, cond: dict) -> pd.DataFrame:
+    tx_count = int(cond.get("tx_count", 4))
+    for i in range(tx_count):
+        baseline_daily_avg = float(cond.get("baseline_daily_avg", 5000))
+        sudden_spend = float(cond.get("sudden_spend", 100000))
+        time_window_hours = float(cond.get("time_window_hours", 1))
+        acct = None
+        try:
+            avg_by_acct = df.groupby("account_id")["amount"].mean()
+            low_accts = avg_by_acct[avg_by_acct <= baseline_daily_avg].index.tolist()
+            if low_accts:
+                acct = random.choice(low_accts)
+        except Exception:
+            acct = None
+        if acct is None:
+            acct = df.sample(1).iloc[0]["account_id"]
+        acct_row = df[df["account_id"] == acct].sample(1).iloc[0]
+        base_time = pd.to_datetime(acct_row["timestamp"])
+        base_time = datetime.utcnow() - timedelta(days=np.random.random()*2)
+        k = random.randint(1, 6)
+        parts = np.random.dirichlet(np.ones(k)) * sudden_spend
+        times = sorted([ base_time + timedelta(seconds=int(np.random.random()*time_window_hours*3600))
+                        for _ in range(k) ])
+        out = []
+        for amt, t in zip(parts, times):
+            row = acct_row.copy().to_dict()
+            row["transaction_id"] = new_tx_id()
+            row["account_id"] = acct
+            row["timestamp"] = t
+            row["amount"] = round(max(1.0, float(amt)), 2)
+            row["is_fraud"] = 1
+            row["fraud_type"] = "spending_spike"
+            out.append(row)
+    return pd.DataFrame(out)
+
+
+def inject_fraud_refund(df: pd.DataFrame, cond: dict) -> pd.DataFrame:
+    tx_count = int(cond.get("tx_count", 4))
+    out = []
+    
+    for i in range(tx_count):
+        purchase_amount = float(cond.get("purchase_amount", 1500))
+        
+        # Generate a refund amount that is always greater than the purchase amount
+        refund_amount = random.uniform(purchase_amount + 500, purchase_amount + 5000)  # Adjust range as necessary
+
+        acct_row = df.sample(1).iloc[0]
+        acct = acct_row["account_id"]
+        time_purchase = pd.to_datetime(acct_row["timestamp"])
+        
+        # Create the purchase transaction
+        purchase_tx = acct_row.copy().to_dict()
+        purchase_tx["transaction_id"] = new_tx_id()
+        purchase_tx["account_id"] = acct
+        purchase_tx["timestamp"] = time_purchase
+        purchase_tx["amount"] = round(purchase_amount, 2)
+        purchase_tx["is_fraud"] = 0
+        purchase_tx["fraud_type"] = ""
+
+        # Create the refund transaction, ensuring the refund is greater than the purchase
+        refund_tx = acct_row.copy().to_dict()
+        refund_tx["transaction_id"] = new_tx_id()
+        refund_tx["account_id"] = acct
+        refund_tx["timestamp"] = time_purchase + timedelta(minutes=random.randint(1, 180))
+        refund_tx["amount"] = round(-abs(refund_amount), 2)
+        refund_tx["is_fraud"] = 1
+        refund_tx["fraud_type"] = "fraud_refund"
+        refund_tx["original_tx_id"] = purchase_tx["transaction_id"]
+
+        # Append both transactions to the output list
+        out.append(purchase_tx)
+        out.append(refund_tx)
+
+    return pd.DataFrame(out)
+
+
+
+# ------------------------------
+# Data hygiene
+# ------------------------------
+
+def clean_no_nan(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    default_fill = {
+        "transaction_id": "unknown_tx",
+        "account_id": "unknown_acct",
+        "card_id": "unknown_card",
+        "timestamp": pd.Timestamp.utcnow(),
+        "amount": 0.0,
+        "currency": "INR",
+        "merchant_country": "IN",
+        "merchant_name": "Unknown Merchant",
+        "merchant_category": "misc",
+        "device_id": "dev_unknown",
+        "is_fraud": 0,
+        "fraud_type": "normal",
+        "original_tx_id": "none"
+    }
+
+    for col, default in default_fill.items():
+        if col not in df.columns:
+            df[col] = default
+
+    df = df.fillna(default_fill)
+
+    for col, default in default_fill.items():
+        if df[col].dtype == object:
+            df[col] = df[col].replace("", default)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").fillna(pd.Timestamp.utcnow())
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["is_fraud"] = df["is_fraud"].astype(int)
+
+    return df
+
+# ------------------------------
+# CTGAN Generator (fast)
+# ------------------------------
+
+
+def train_ctgan_fast(base_df: pd.DataFrame, epochs: int = 1, batch_size: int = 500):
+    df = base_df.copy()
+    df["timestamp_int"] = df["timestamp"].astype("int64") // 10**9
+    train_cols = [
+        "timestamp_int", "amount", "currency", "merchant_country",
+        "merchant_name", "merchant_category", "account_id", "card_id",
+        "device_id"
+    ]
+    train_df = df[train_cols].copy()
+    categorical_cols = [
+        "currency", "merchant_country", "merchant_name",
+        "merchant_category", "account_id", "card_id", "device_id"
+    ]
+    ctgan = CTGAN(epochs=max(1, epochs), batch_size=batch_size, verbose=False)
+    ctgan.fit(train_df, categorical_cols)
+    return ctgan, train_cols
+
+def ctgan_generate_fast(ctgan, train_cols, n=1000):
+    synth = ctgan.sample(n)
+    if "timestamp_int" in synth.columns:
+        synth["timestamp"] = pd.to_datetime(synth["timestamp_int"], unit="s", errors="coerce")
+        synth = synth.drop(columns=["timestamp_int"], errors="ignore")
+    synth["transaction_id"] = [new_tx_id() for _ in range(len(synth))]
+    synth["is_fraud"] = 0
+    synth["fraud_type"] = ""
+    synth["original_tx_id"] = None
+    synth = fix_columns(synth)
+    return synth
+
+# ------------------------------
+# Tiny VAE (very fast)
+# ------------------------------
+
+
+def build_train_vae_fast(numeric_df: pd.DataFrame, latent_dim=4, epochs=1, batch_size=64, verbose=0):
+    numeric_cols = [c for c in ["timestamp_int", "amount"] if c in numeric_df.columns]
+    X = numeric_df[numeric_cols].astype(float).fillna(0.0).values
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+    input_dim = Xs.shape[1]
+
+    # ---------------------------
+    # Build encoder
+    # ---------------------------
+    inputs = Input(shape=(input_dim,), name="vae_input")
+    h = Dense(32, activation="relu")(inputs)
+    z_mean = Dense(latent_dim, name="z_mean")(h)
+    z_log_var = Dense(latent_dim, name="z_log_var")(h)
+
+    # Sampling layer using Lambda (valid in Keras3)
+    def sampling(args):
+        z_mean_, z_log_var_ = args
+        epsilon = tf.random.normal(shape=(tf.shape(z_mean_)[0], latent_dim))
+        return z_mean_ + tf.exp(0.5 * z_log_var_) * epsilon
+
+    z = Lambda(sampling, name="z")([z_mean, z_log_var])
+
+    # ---------------------------
+    # Build decoder
+    # ---------------------------
+    latent_inputs = Input(shape=(latent_dim,), name="decoder_input")
+    x = Dense(32, activation="relu")(latent_inputs)
+    outputs = Dense(input_dim, activation="linear")(x)
+    decoder = Model(latent_inputs, outputs, name="decoder")
+
+    outputs_decoded = decoder(z)
+
+    # ---------------------------
+    # Use custom VAE layer to compute loss
+    # ---------------------------
+    class VAELossLayer(tf.keras.layers.Layer):
+        def call(self, inputs):
+            x_in, x_out, zm, zv = inputs
+
+            reconstruction_loss = tf.reduce_mean(tf.square(x_in - x_out))
+            kl_loss = -0.5 * tf.reduce_mean(
+                1 + zv - tf.square(zm) - tf.exp(zv)
+            )
+
+            self.add_loss(reconstruction_loss + kl_loss)
+            return x_out
+
+    vae_outputs = VAELossLayer(name="vae_loss")([inputs, outputs_decoded, z_mean, z_log_var])
+    vae = Model(inputs, vae_outputs, name="vae")
+
+    vae.compile(optimizer="adam")
+    vae.fit(Xs, epochs=max(1, epochs), batch_size=batch_size, verbose=verbose)
+
+    encoder = Model(inputs, [z_mean, z_log_var, z], name="encoder")
+
+    return vae, encoder, decoder, scaler, numeric_cols, latent_dim
+
+
+def vae_generate_fast(encoder, decoder, scaler, numeric_cols, n=500, latent_dim=4):
+    z_samples = np.random.normal(size=(n, latent_dim))
+    decoded = decoder.predict(z_samples, verbose=0)
+    decoded_inv = scaler.inverse_transform(decoded)
+    df_num = pd.DataFrame(decoded_inv, columns=numeric_cols)
+    if "timestamp_int" in df_num.columns:
+        df_num["timestamp"] = pd.to_datetime(df_num["timestamp_int"], unit="s", errors="coerce")
+        df_num = df_num.drop(columns=["timestamp_int"], errors="ignore")
+    return df_num
+
+# ------------------------------
+# Combined generator
+# ------------------------------
+
+def generate_combined_fast(base_df: pd.DataFrame, ctgan_epochs=1, ctgan_n=1000, vae_epochs=1, vae_n=500, vae_latent=4):
+    base_fixed = fix_columns(base_df)
+    ctgan_obj, train_cols = None, None
+    ctgan_obj, train_cols = train_ctgan_fast(base_fixed, epochs=ctgan_epochs)
+
+    synth_ctgan = ctgan_generate_fast(ctgan_obj, train_cols, n=ctgan_n)
+
+    base_for_vae = base_fixed.copy()
+    base_for_vae["timestamp_int"] = base_for_vae["timestamp"].astype("int64") // 10**9
+
+    vae_model, vae_enc, vae_dec, vae_scaler, vae_numeric_cols, vae_latent_dim = build_train_vae_fast(
+                base_for_vae, latent_dim=vae_latent, epochs=vae_epochs, batch_size=64, verbose=0
+    )
+    df_num = vae_generate_fast(vae_enc, vae_dec, vae_scaler, vae_numeric_cols, n=vae_n, latent_dim=vae_latent_dim)
+    filled_rows = []
+    for i in range(len(df_num)):
+        sample_row = base_fixed.sample(1).iloc[0].to_dict()
+        sample_row.update(df_num.iloc[i].to_dict())
+        sample_row["transaction_id"] = new_tx_id()
+        sample_row["is_fraud"] = 0
+        sample_row["fraud_type"] = ""
+        sample_row["original_tx_id"] = None
+        filled_rows.append(sample_row)
+    synth_vae = pd.DataFrame(filled_rows)
+    synth_vae = fix_columns(synth_vae)
+
+    combined = pd.concat([synth_ctgan, synth_vae], ignore_index=True)
+    combined = fix_columns(combined)
+    combined = clean_no_nan(combined)
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"], errors="coerce").fillna(datetime.utcnow())
+    return combined
+
+# ------------------------------
+# apply_fraud_patterns (unchanged)
+# ------------------------------
+
+def apply_fraud_patterns(synthetic_df: pd.DataFrame, patterns: list, home_country="IN") -> pd.DataFrame:
+    synth = synthetic_df.copy().reset_index(drop=True)
+    synth["is_fraud"] = synth.get("is_fraud", 0).fillna(0).astype(int)
+    synth["fraud_type"] = synth.get("fraud_type", "").fillna("")
+    new_rows = []
+    for cond in patterns:
+        pattern = cond.get("pattern", "")
+        if pattern == "international_mix":
+            df_new = inject_international_mix(synth, cond, home_country=home_country)
+            new_rows.append(df_new)
+        elif pattern == "rapid_high_value":
+            df_new = inject_rapid_high_value(synth, cond)
+            new_rows.append(df_new)
+        elif pattern == "spending_spike":
+            df_new = inject_spending_spike(synth, cond)
+            new_rows.append(df_new)
+        elif pattern == "fraud_refund":
+            df_new = inject_fraud_refund(synth, cond)
+            new_rows.append(df_new)
+        else:
+            print(f"[warn] unknown pattern {pattern} - skipping")
+    if new_rows:
+        added = pd.concat(new_rows, ignore_index=True)
+        added = fix_columns(added)
+        result = pd.concat([synth, added], ignore_index=True)
+    else:
+        result = synth
+    result["timestamp"] = pd.to_datetime(result["timestamp"])
+    result = result.sort_values("timestamp").reset_index(drop=True)
+    return clean_no_nan(result)
+
+# ------------------------------
+# Main demo
+# ------------------------------
+def main_demo(out_csv="combined_fast_with_frauds.csv"):
+    # minimal demo base data
+    sample_base = pd.DataFrame({
+        "transaction_id": [str(uuid.uuid4()) for _ in range(2000)],
+        "account_id": ["acct_" + uuid.uuid4().hex[:8] for _ in range(2000)],
+        "card_id": ["card_" + uuid.uuid4().hex[:8] for _ in range(2000)],
+        "timestamp": [datetime.utcnow() - timedelta(days=random.random()*60) for _ in range(2000)],
+        "amount": np.round(np.random.uniform(10, 5000, size=2000), 2),
+        "currency": ["INR"]*2000,
+        "merchant_country": ["IN"]*2000,
+        "merchant_name": ["Merchant_"+str(i % 50) for i in range(2000)],
+        "merchant_category": ["misc"]*2000,
+        "device_id": ["dev_"+str(i % 80) for i in range(2000)]
+    })
+
+    print("[info] generating combined synthetic (CTGAN+VAE)...")
+    combined = generate_combined_fast(sample_base, ctgan_epochs=1, ctgan_n=1000, vae_epochs=1, vae_n=500, vae_latent=4)
+    print("[info] combined rows:", len(combined))
+
+    patterns = [
+        {"pattern": "international_mix", "total_tx": 50, "same_country": 3, "foreign_countries": 2, "time_window_hours": 24},
+        {"pattern": "rapid_high_value", "total_tx": 50, "tx_count": 4, "max_amount": 5000, "time_window_min": 10},
+        {"pattern": "spending_spike", "tx_count": 50, "baseline_daily_avg": 2000, "sudden_spend": 50000, "time_window_hours": 1},
+        {"pattern": "fraud_refund", "tx_count": 50, "purchase_amount": 1500, "refund_amount": 3000}
+    ]
+    final = apply_fraud_patterns(combined, patterns, home_country="IN")
+    print("[info] final rows (with frauds):", len(final))
+    print(final[final["is_fraud"]==1]["fraud_type"].value_counts())
+    final.to_csv(out_csv, index=False)
+    print(f"[info] saved output to {out_csv}")
+
+if __name__ == "__main__":
+    main_demo("saketh.csv")
