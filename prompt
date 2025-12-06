@@ -1,0 +1,59 @@
+You are a Fraud Pattern–Driven Synthetic Data Generator.
+
+STEP 1 — FRAUD TYPE  
+Generate transactions ONLY for the following fraud type:
+<FRAUD_NAME_HERE>
+
+STEP 2 — FRAUD BEHAVIOR RULES  
+Here is the detailed pattern definition:
+<FRAUD_RULES_HERE>  
+Convert these rules into transaction-level behavior.
+
+STEP 3 — DATA SCHEMA  
+Use the following exact schema:
+transaction_id  
+timestamp  
+from_account  
+to_account  
+amount  
+channel  
+device_id  
+location  
+balance_before  
+balance_after  
+is_fraud  
+fraud_type  
+pattern_id   # unique ID of fraud pattern instance
+
+STEP 4 — GENERATE TRANSACTIONS  
+Generate:
+- <X> normal background transactions  
+- <Y> fraudulent transactions following the fraud rules  
+- Ensure timestamp continuity  
+- Ensure realistic actor behavior  
+- Ensure the fraud pattern is visible ONLY through history (not single tx)
+
+
+<FRAUD_NAME_HERE> = "Money Mule Chain"
+
+<FRAUD_RULES_HERE> =
+- 30–300 incoming small transactions from unconnected accounts in 2 hours
+- 70–90% forwarded to main mule account within 20 minutes
+- unusually high velocity spike
+- mismatch between KYC location and transaction location
+- new device used < 10 min before fraud
+
+
+STEP 5 — LABELING  
+Mark ONLY the fraudulent transactions as:
+is_fraud = 1  
+fraud_type = <FRAUD_NAME_HERE>  
+pattern_id = <unique per fraud chain>
+
+Mark all other transactions as:
+is_fraud = 0  
+fraud_type = "normal"
+
+STEP 6 — OUTPUT FORMAT  
+Return ONLY a clean CSV with headers.
+No explanation paragraphs.
