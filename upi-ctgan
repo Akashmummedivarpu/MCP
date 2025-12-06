@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+scale_upi_with_ctgan.py
+
+Scale UPI transaction generation using CTGAN (or fallback sampler), then apply V1/V2/V3 validations.
+
+Usage:
+    pip install pandas numpy ctgan scikit-learn   # ctgan optional; if absent script falls back to jitter-sampling
+    python scale_upi_with_ctgan.py --help
+"""
+
+import argparse
+import logging
+import random
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
+
+import numpy as np
+import pandas as pd
+
+# Try import CTGAN; we'll gracefully fallback if not installed
+try:
+    from ctgan import CTGAN
+    CTGAN_AVAILABLE = True
+except Exception:
+    CTGAN_AVAILABLE = False
+
+# ---------------------------
+# Constants / Thresholds (your spec)
+# ---------------------------
+V1_THRESH = {
+    "unique_senders": 30,
+    "time_window_minutes": 120,
+    "account_age_days_max": 90
+}
+V2_THRESH = {
+    "pass_through_percent": 80,
+    "time_window_minutes": 5
+}
+V3_THRESH = {
+    "dormant_tx_per_day_max": 5,
+    "active_tx_per_hour_min": 50
+}
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def new_tx_id():
+    return str(uuid.uuid4())
+
+def gen_phone_upi():
+    ph = str(random.randint(7000000000, 9999999999))
+    banks = ["ybl","axl","oksbi","okhdfc","okicici","upi","paytm","axis","yes","kotak"]
+    return f"{ph}@{random.choice(banks)}"
+
+def gen_name_upi():
+    names = ["rama","sita","hema","purna","kumar","anil","geeta","ravi","sunil","sree","nilesh","mala","veena","ajay","rita"]
+    name = random.choice(names) + ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=2))
+    banks = ["ybl","axl","oksbi","okhdfc","okicici","upi","paytm","axis","yes","kotak"]
+    return f"{name}@{random.choice(banks)}"
+
+def gen_upi():
+    return gen_phone_upi() if random.random() < 0.65 else gen_name_upi()
+
+def random_account_id():
+    return gen_upi()
+
+# Monotonic unique timestamp generator (global)
+GLOBAL_TIMESTAMP = datetime.utcnow() - timedelta(hours=1)
+def next_timestamp(min_ms=10, max_ms=1200) -> datetime:
+    """
+    Returns a strictly increasing datetime by adding random ms between min_ms and max_ms.
+    """
+    global GLOBAL_TIMESTAMP
+    delta_ms = random.randint(min_ms, max_ms)
+    GLOBAL_TIMESTAMP = GLOBAL_TIMESTAMP + timedelta(milliseconds=delta_ms)
+    return GLOBAL_TIMESTAMP
+
+# ---------------------------
+# Schema fixer for UPI transactions
+# ---------------------------
+REQUIRED_COLS = [
+    "tx_id", "from_account_id", "to_account_id", "timestamp", "amount",
+    "from_account_age_days", "to_account_age_days",
+    "velocity_in_last_hour", "received_velocity_last_hour", "pass_through_percent",
+    "V1", "V2", "V3", "triggered_validations", "num_validations", "classification"
+]
+
+def fix_upi_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # Fill core columns
+    n = len(df)
+    if "tx_id" not in df.columns:
+        df["tx_id"] = [new_tx_id() for _ in range(n)]
+    if "from_account_id" not in df.columns:
+        df["from_account_id"] = [random_account_id() for _ in range(n)]
+    if "to_account_id" not in df.columns:
+        df["to_account_id"] = [random_account_id() for _ in range(n)]
+    if "timestamp" not in df.columns:
+        df["timestamp"] = [next_timestamp() for _ in range(n)]
+    if "amount" not in df.columns:
+        df["amount"] = np.round(np.random.uniform(5.0, 20000.0, size=n), 2)
+
+    # account ages if not present
+    if "from_account_age_days" not in df.columns:
+        df["from_account_age_days"] = np.random.randint(1, 2000, size=n)
+    if "to_account_age_days" not in df.columns:
+        df["to_account_age_days"] = np.random.randint(1, 2000, size=n)
+
+    # placeholders for computed columns
+    for c in ["velocity_in_last_hour", "received_velocity_last_hour", "pass_through_percent"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    # flags
+    for c in ["V1", "V2", "V3"]:
+        if c not in df.columns:
+            df[c] = False
+
+    if "triggered_validations" not in df.columns:
+        df["triggered_validations"] = None
+    if "num_validations" not in df.columns:
+        df["num_validations"] = 0
+    if "classification" not in df.columns:
+        df["classification"] = "normal"
+
+    # ensure timestamp dtype
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce").fillna(pd.Timestamp.utcnow())
+
+    return df.loc[:, df.columns]  # preserve all columns (not restrict)
+
+# ---------------------------
+# Simple base builder (if user doesn't provide a base CSV)
+# ---------------------------
+def build_base_sample(n: int = 2000, seed: int = 42) -> pd.DataFrame:
+    random.seed(seed)
+    np.random.seed(seed)
+    rows = []
+    for _ in range(n):
+        f = gen_upi()
+        t = gen_upi()
+        # ensure occasionally same account to allow pass-through patterns
+        amount = round(random.uniform(5, 5000), 2)
+        ts = next_timestamp()
+        rows.append({
+            "tx_id": new_tx_id(),
+            "from_account_id": f,
+            "to_account_id": t,
+            "timestamp": ts,
+            "amount": amount,
+            "from_account_age_days": random.randint(1, 2000),
+            "to_account_age_days": random.randint(1, 2000)
+        })
+    return fix_upi_columns(pd.DataFrame(rows))
+
+# ---------------------------
+# CTGAN training & generation (with fallback)
+# ---------------------------
+def train_ctgan_on_base(base_df: pd.DataFrame, epochs: int = 10, batch_size: int = 500, seed: Optional[int] = None) -> Tuple[Optional[object], List[str], List[str]]:
+    """
+    Train CTGAN if available. Returns (ctgan_model, train_cols, categorical_cols).
+    If CTGAN not available or epochs <= 0, return (None, train_cols, categorical_cols).
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    df = base_df.copy()
+    # convert timestamp -> integer seconds for CTGAN to model
+    df["timestamp_int"] = df["timestamp"].astype("int64") // 10**9
+
+    # Choose columns that CTGAN will model (avoid flags)
+    train_cols = ["timestamp_int", "amount", "from_account_id", "to_account_id"]
+    # For CTGAN we will treat account ids as categorical (CTGAN can handle high-cardinality)
+    categorical_cols = ["from_account_id", "to_account_id"]
+
+    if not CTGAN_AVAILABLE or epochs <= 0:
+        logging.info("CTGAN not available or epochs <= 0. Skipping CTGAN training; will use jitter-sampling fallback.")
+        return None, train_cols, categorical_cols
+
+    ctgan = CTGAN(epochs=epochs, batch_size=batch_size, verbose=True, cuda=False, random_state=seed)
+    train_df = df[train_cols].copy()
+    ctgan.fit(train_df, categorical_cols=categorical_cols)
+    return ctgan, train_cols, categorical_cols
+
+def ctgan_sample_or_fallback(ctgan, train_cols: List[str], n: int, base_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If ctgan is present, use ctgan.sample. Otherwise, fallback by sampling base_df with jitter on timestamp and small perturbations on amount.
+    """
+    if ctgan is not None:
+        synth = ctgan.sample(n)
+        # convert timestamp back to datetime
+        if "timestamp_int" in synth.columns:
+            synth["timestamp"] = pd.to_datetime(synth["timestamp_int"], unit="s", errors="coerce")
+            synth.drop(columns=["timestamp_int"], inplace=True, errors="ignore")
+    else:
+        # fallback: sample with replacement and jitter timestamp & amount
+        logging.info("Using fallback sampler: sampling base_df with jitter.")
+        synth = base_df.sample(n, replace=True).reset_index(drop=True).copy()
+        synth["timestamp"] = [next_timestamp() for _ in range(len(synth))]
+        # jitter amount +/- up to 15%
+        synth["amount"] = (synth["amount"] * np.random.uniform(0.85, 1.15, size=len(synth))).round(2)
+
+    # Ensure expected cols
+    # Map ctgan columns to UPI names if ctgan produced different names
+    if "from_account_id" not in synth.columns and "account_id" in synth.columns:
+        synth = synth.rename(columns={"account_id": "from_account_id"})
+    # If ctgan produced to_account as 'to_account_id' ensure present
+    if "to_account_id" not in synth.columns and "to_account" in synth.columns:
+        synth = synth.rename(columns={"to_account": "to_account_id"})
+
+    # Minimum normalization
+    synth = fix_upi_columns(synth)
+
+    return synth
+
+# ---------------------------
+# Ensure unique increasing timestamps (after CTGAN sampling)
+# ---------------------------
+def enforce_monotonic_unique_timestamps(df: pd.DataFrame, min_ms=5, max_ms=1200) -> pd.DataFrame:
+    df = df.sort_values("timestamp").reset_index(drop=True).copy()
+    current = df.loc[0, "timestamp"] if len(df) > 0 else datetime.utcnow()
+    for i in range(len(df)):
+        # ensure timestamp at index i is strictly > previous
+        t = pd.to_datetime(df.at[i, "timestamp"])
+        if t <= current:
+            # push forward
+            delta_ms = random.randint(min_ms, max_ms)
+            t = current + timedelta(milliseconds=delta_ms)
+        # update current and df
+        current = t
+        df.at[i, "timestamp"] = t
+    return df
+
+# ---------------------------
+# V1/V2/V3 Detection (adapted from earlier code)
+# ---------------------------
+def compute_velocity_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["velocity_in_last_hour"] = 0
+    df["received_velocity_last_hour"] = 0
+    df["pass_through_percent"] = np.nan
+
+    for idx, row in df.iterrows():
+        fa = row["from_account_id"]
+        ta = row["to_account_id"]
+        ts = row["timestamp"]
+
+        # sent velocity
+        mask_sent = (df["from_account_id"] == fa) & (df["timestamp"] >= ts - pd.Timedelta(hours=1)) & (df["timestamp"] < ts)
+        df.at[idx, "velocity_in_last_hour"] = int(mask_sent.sum())
+
+        # received velocity
+        mask_recv = (df["to_account_id"] == ta) & (df["timestamp"] >= ts - pd.Timedelta(hours=1)) & (df["timestamp"] < ts)
+        df.at[idx, "received_velocity_last_hour"] = int(mask_recv.sum())
+
+        # pass-through percent: look for received to 'fa' in prior V2_THRESH minutes
+        window_start = ts - pd.Timedelta(minutes=V2_THRESH["time_window_minutes"])
+        recv_to_fa_mask = (df["to_account_id"] == fa) & (df["timestamp"] >= window_start) & (df["timestamp"] < ts)
+        received_sum = df.loc[recv_to_fa_mask, "amount"].sum()
+        if received_sum > 0:
+            df.at[idx, "pass_through_percent"] = round((row["amount"] / received_sum) * 100, 2)
+
+    return df
+
+def detect_V1(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["V1"] = False
+    grouped = df.groupby("to_account_id")
+    for acc, group in grouped:
+        g = group.sort_values("timestamp").reset_index()
+        times = list(g["timestamp"])
+        senders = list(g["from_account_id"])
+        n = len(g)
+        i = 0
+        j = 0
+        while i < n:
+            window_start = times[i]
+            while j < n and (times[j] - window_start) <= pd.Timedelta(minutes=V1_THRESH["time_window_minutes"]):
+                j += 1
+            unique_senders = set(senders[i:j])
+            if len(unique_senders) >= V1_THRESH["unique_senders"]:
+                # check to_account age; use the to_account_age_days from any row of this group (if present)
+                acc_age = int(g.loc[i, "to_account_age_days"]) if "to_account_age_days" in g.columns else 9999
+                if acc_age < V1_THRESH["account_age_days_max"]:
+                    idxs = g.loc[i:j-1, "index"].values
+                    df.loc[idxs, "V1"] = True
+            i += 1
+    return df
+
+def detect_V2(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["V2"] = False
+    for idx, row in df.iterrows():
+        to_acc = row["to_account_id"]
+        ts = row["timestamp"]
+        window_end = ts + pd.Timedelta(minutes=V2_THRESH["time_window_minutes"])
+        out_mask = (df["from_account_id"] == to_acc) & (df["timestamp"] > ts) & (df["timestamp"] <= window_end)
+        forwarded_sum = df.loc[out_mask, "amount"].sum()
+        received_amount = row["amount"]
+        if received_amount > 0:
+            pct = (forwarded_sum / received_amount) * 100
+            if pct >= V2_THRESH["pass_through_percent"]:
+                df.at[idx, "V2"] = True
+                df.loc[out_mask, "V2"] = True
+    return df
+
+def detect_V3(df: pd.DataFrame, account_hist_tx_per_day: Optional[dict] = None) -> pd.DataFrame:
+    """
+    V3 uses historical tx/day baseline. If account_hist_tx_per_day is None
+    we will use 'from_account_age_days' heuristic to pick dormant accounts randomly.
+    """
+    df = df.copy()
+    df["V3"] = False
+
+    # Build a default baseline dict from df if not provided (random low baselines for some)
+    if account_hist_tx_per_day is None:
+        # choose some accounts to be dormant (random)
+        unique_from = df["from_account_id"].unique().tolist()
+        account_hist_tx_per_day = {}
+        for acc in unique_from:
+            account_hist_tx_per_day[acc] = random.choice([0,1,2,3,4,5,8,10])
+
+    for acc, group in df.groupby("from_account_id"):
+        hist = account_hist_tx_per_day.get(acc, 999)
+        if hist <= V3_THRESH["dormant_tx_per_day_max"]:
+            times = sorted(group["timestamp"].tolist())
+            n = len(times)
+            i = 0
+            j = 0
+            while i < n:
+                start = times[i]
+                while j < n and (times[j] - start) <= pd.Timedelta(hours=1):
+                    j += 1
+                window_count = j - i
+                if window_count >= V3_THRESH["active_tx_per_hour_min"]:
+                    # mark those outgoing txs in the df as V3
+                    mask = (df["from_account_id"] == acc) & (df["timestamp"] >= start) & (df["timestamp"] <= times[j-1])
+                    df.loc[mask, "V3"] = True
+                i += 1
+    return df
+
+
+def apply_validations_and_classify(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Drop old classification-related columns if they exist,
+    # to avoid duplicate names becoming 2D columns.
+    for c in ["triggered_validations", "num_validations", "classification"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
+
+    # Run metrics and detectors
+    df = compute_velocity_metrics(df)
+    df = detect_V1(df)
+    df = detect_V2(df)
+    df = detect_V3(df)
+
+    # Build new classification columns
+    def classify_row(r):
+        flags = []
+        if r.get("V1"): flags.append("V1")
+        if r.get("V2"): flags.append("V2")
+        if r.get("V3"): flags.append("V3")
+        cnt = len(flags)
+        if cnt >= 2:
+            cls = "upi_fraud_type"
+        elif cnt == 1:
+            cls = "anomaly"
+        else:
+            cls = "normal"
+        return pd.Series({
+            "triggered_validations": ",".join(flags) if flags else None,
+            "num_validations": cnt,
+            "classification": cls
+        })
+
+    class_df = df.apply(classify_row, axis=1)
+    df = pd.concat([df, class_df], axis=1)
+
+    # Ensure boolean flags
+    for c in ["V1", "V2", "V3"]:
+        df[c] = df[c].fillna(False).astype(bool)
+
+    return df
+
+#------------------------
+# Top-level run
+# ---------------------------
+def run_pipeline(
+    base_csv: Optional[str],
+    output_csv: str,
+    synthetic_count: int,
+    ctgan_epochs: int,
+    seed: int
+):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # 1) Load or build base
+    if base_csv:
+        logging.info("Loading base CSV: %s", base_csv)
+        base_df = pd.read_csv(base_csv, parse_dates=["timestamp"], low_memory=False)
+        base_df = fix_upi_columns(base_df)
+    else:
+        logging.info("No base CSV provided — building synthetic base sample.")
+        base_df = build_base_sample(n=2000, seed=seed)
+
+    # 2) Train CTGAN (or skip)
+    ctgan_model, train_cols, cat_cols = train_ctgan_on_base(base_df, epochs=ctgan_epochs, batch_size=500, seed=seed)
+
+    # 3) Generate synthetic rows
+    synth = ctgan_sample_or_fallback(ctgan_model, train_cols, synthetic_count, base_df)
+
+    # 4) Ensure monotonic unique timestamps
+    synth = enforce_monotonic_unique_timestamps(synth)
+
+    # 5) Fill missing account ages by mapping from base_df where possible
+    # Build mapping from account -> min age from base_df
+    age_map = {}
+    for _, r in base_df.iterrows():
+        age_map.setdefault(r["from_account_id"], int(r.get("from_account_age_days", 9999)))
+        age_map.setdefault(r["to_account_id"], int(r.get("to_account_age_days", 9999)))
+    # apply
+    synth["from_account_age_days"] = synth["from_account_id"].map(age_map).fillna(synth["from_account_age_days"]).astype(int)
+    synth["to_account_age_days"] = synth["to_account_id"].map(age_map).fillna(synth["to_account_age_days"]).astype(int)
+
+    # 6) Apply validations and classification
+    final = apply_validations_and_classify(synth)
+
+    # 7) Reorder columns to a clean schema and save
+    final_cols_order = [
+        "tx_id", "timestamp",
+        "from_account_id", "from_account_age_days",
+        "to_account_id", "to_account_age_days",
+        "amount",
+        "velocity_in_last_hour", "received_velocity_last_hour", "pass_through_percent",
+        "V1", "V2", "V3",
+        "triggered_validations", "num_validations", "classification"
+    ]
+    # ensure all present
+    for c in final_cols_order:
+        if c not in final.columns:
+            final[c] = None
+
+    final = final[final_cols_order].sort_values("timestamp").reset_index(drop=True)
+    final.to_csv(output_csv, index=False)
+    logging.info("Saved final synthetic dataset with validations to: %s", output_csv)
+
+    # Print summary
+    print("Total generated:", len(final))
+    print("Classification distribution:")
+    print(final["classification"].value_counts(dropna=False))
+    # show sample fraud rows
+    fraud_sample = final[final["classification"] != "normal"].head(10)
+    if not fraud_sample.empty:
+        print("\nSample flagged rows (up to 10):")
+        print(fraud_sample.to_string(index=False))
+    else:
+        print("\nNo anomalies were found in generated data — adjust generation or thresholds if desired.")
+
+# ---------------------------
+# CLI
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Scale UPI synthetic generation using CTGAN and apply V1/V2/V3 validations.")
+    p.add_argument("--base-csv", "-b", default=None, help="Optional base CSV path to train CTGAN (must contain timestamp). If omitted, a synthetic base will be built.")
+    p.add_argument("--output", "-o", default="scaled_upi_with_validations.csv", help="Output CSV filename")
+    p.add_argument("--n", type=int, default=10000, help="Number of synthetic rows to generate")
+    p.add_argument("--epochs", type=int, default=20, help="CTGAN training epochs (0 to skip/train)")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    return p.parse_args()
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+    run_pipeline(args.base_csv, args.output, args.n, args.epochs, args.seed)
