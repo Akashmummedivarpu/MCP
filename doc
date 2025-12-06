@@ -1,0 +1,64 @@
+Fraud Type,Core Columns (Used in 90%+ Real-Time Systems),Fraud-Specific Columns (Unique Triggers),Derived Columns (Real-Time Computations),Why These Maximize Real-Time Detection
+1. UPI Money-Mule Chain,"- txn_id: Unique transaction hash
+- timestamp: ISO datetime (for sequencing)
+- from_upi_id: Sender UPI (hashed)
+- to_upi_id: Receiver UPI (hashed)
+- amount: INR float
+- transaction_type: 'PAY'/'COLLECT'
+- ip_address: Anonymized IPv4
+- device_id: Fingerprint hash
+- user_lat/user_long: Geolocation","- account_age_days: Days since UPI creation
+- incoming_count_last_24h: # unrelated senders","- velocity_in_out_ratio: Outgoing/incoming % (e.g., >85% = flag)
+- mule_cluster_score: Graph centrality (e.g., NetworkX degree)
+- unrelated_sender_diversity: Unique from_upi_ids (>30 = red)",NPCI/Feedzai use velocity + graph for 95% catch rate. Small incoming (₹8k-45k) + fast forward (<120s) = instant block.
+2. SIM-Swap → ATO,"- txn_id: Unique ID
+- timestamp: For event ordering
+- from_account_id: Bank/UPI ID (hashed)
+- to_account_id: Payee ID
+- amount: High-value float
+- transaction_type: 'TRANSFER'/'ADD_PAYEE'
+- ip_address: For geo-mismatch
+- device_id: For new device flag
+- user_lat/user_long: Login geo","- sim_swap_timestamp: Recent swap time (from telco API)
+- otp_delivery_number: New/old phone hash
+- new_payee_added: Boolean (first-time add)","- login_device_change: Seconds since last device
+- post_swap_velocity: Txns in <15min after swap (>1 = block)
+- geo_anomaly_score: Distance from home (km)","Jio/HDFC APIs flag swap + new device in <2min. BioCatch behavioral drop (e.g., typing speed) catches 98%."
+3. Card-Testing Bots,"- txn_id: Auth attempt ID
+- timestamp: For burst detection
+- card_number_hash: Anonymized PAN
+- amount: Low-value (<₹100)
+- transaction_type: 'AUTH_ONLY'
+- merchant_name: e.g., 'Shopify Test'
+- ip_address: VPN/Tor flag
+- device_id: Bot fingerprint
+- user_lat/user_long: Proxy geo","- auth_response_code: Decline code (e.g., 05=DoNotHonor)
+- bin_iin: Card issuer prefix","- attempts_per_min: Count >100 in 5min
+- decline_rate: % failures (>90% = bot)
+- same_ip_burst: Attempts from single IP (>500)",Stripe Radar/FICO: Velocity + decline rate blocks in <1s. Device proxy-piercing (Kount) IDs bots 99%.
+4. Credit-Card Bust-Out,"- txn_id: ID
+- timestamp: For historical window
+- card_number_hash: PAN
+- amount: Sudden spike
+- transaction_type: 'PURCHASE'
+- merchant_name: High-risk (jewellery)
+- ip_address: Consistent user
+- device_id: Long-term
+- user_lat/user_long: Home geo","- credit_limit: Card limit
+- pan_count: # cards per customer
+- utilization_history: JSON array of past %","- utilization_spike: From <15% to >95% in 72h
+- category_shift_score: From grocery to electronics (0-1)
+- dormancy_days: Idle period before bust (180-365)",Experian/Axis: Time-series utilization trends (6-12mo nurture) flag in 1-48h. Multi-card max-out = 100% hit.
+5. Screen-Share Collect,"- txn_id: ID
+- timestamp: Approval time
+- from_upi_id: Victim UPI
+- to_upi_id: Fraudster UPI (new)
+- amount: High (>₹50k)
+- transaction_type: 'COLLECT'
+- ip_address: Victim's IP
+- device_id: Victim device
+- user_lat/user_long: Stable geo","- collect_request_flag: Boolean
+- remote_tool_hash: AnyDesk/TeamViewer ID
+- approval_delay_sec: Time from request to PIN","- post_call_velocity: Txns after missed call (<90s)
+- first_time_collect: Boolean (no prior collects)
+- behavioral_anomaly: Screen share session length (min)",Paytm/Razorpay: Remote tool + quick approval blocks in <30s. BioCatch fingerprints AnyDesk in real-time.
